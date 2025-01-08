@@ -13,13 +13,10 @@ from sklearn.metrics import r2_score
 parser = argparse.ArgumentParser(description='Epidemic Pred')
 parser.add_argument('--data', type=str, default='WX', help='location of the data file')
 parser.add_argument('--show_train', action='store_true', help='show train result', default=False)
-parser.add_argument('--show_seir', action='store_true', help='show train result', default=False)
+parser.add_argument('--show_seir', action='store_true', help='show seir', default=False)
+parser.add_argument('--test_opt', action='store_true', help='optimize while test', default=False)
 args = parser.parse_args()
 
-
-# 训练参数保存和数据的路径
-BASE_SAVE = 'checkpoint/checkpoint_epidemic'
-BASE_DATA = 'data/data_epidemic'
 
 # 数据集
 # JHT: R=47 T=406 (2020/1/20-2021/2/28)
@@ -31,6 +28,10 @@ BASE_DATA = 'data/data_epidemic'
 DATASET = args.data
 # 结果保存名
 NAME = DATASET
+
+# 训练参数保存和数据的路径
+BASE_SAVE = 'checkpoint/checkpoint_epidemic/' + NAME
+BASE_DATA = 'data/data_epidemic'
 
 # TRAIN/TEST SPLIT
 # 训练集进行PSO优化的时间间隔
@@ -127,9 +128,9 @@ def SEIR_Multi(beta, pred_steps, df_init, od_flows):
 
 # 训练中使用的损失函数
 def loss(pred, truth):
-    truth = truth.clip(min=1)
+    #truth = truth.clip(min=1)
     mape_lambda = 300
-    return np.mean(np.abs(pred - truth)) + np.mean(np.abs(pred - truth) / truth) * mape_lambda
+    return np.mean(np.abs(pred - truth)) + np.mean(np.abs(pred - truth) / truth.clip(min=1)) * mape_lambda
 
 
 # 训练中使用的优化函数
@@ -168,27 +169,30 @@ def run_interval_PSO(pred_steps, df_seir, od_flows, infects):
 # 以T_INTERVAL划分批次，优化beta以及得出在训练集开始时的初始seir矩阵
 def run_all_PSO(od_flows, infects):
     assert len(od_flows) == len(infects), 'len of od_flows and infects should be equal'
-    T_out = len(od_flows)
+    T_train = len(od_flows)
+    pred_steps_all = np.arange(T_train)
     # 定义初始的seir矩阵
     df_seir = pd.DataFrame(np.zeros((num_regions, len(['S', 'E', 'I', 'R'])), dtype='int'), index=regions, columns=['S', 'E', 'I', 'R'])
     df_seir['I'] = infects[0, :]
     df_seir['S'] = population - infects[0, :]
-    pred_steps_all = np.arange(T_out)
+    # 存储结果的数组
     preds = []
     opt_betas = [] 
-    for i in range(math.ceil(T_out / T_INTERVAL)):
+    for i in range(math.ceil(T_train / T_INTERVAL)):
         pred_steps = pred_steps_all[i*T_INTERVAL:(i+1)*T_INTERVAL]
+        # 进行PSO参数优化
         cost, pos = run_interval_PSO(pred_steps, df_seir, od_flows, infects)
-        df_seir, pred = SEIR_Multi(pos, pred_steps, df_seir, od_flows)
         if args.show_train:
-            print(i, pred_steps, cost, pos, time.ctime())
+            print(pred_steps, cost, pos, time.ctime())
+        # 使用优化后的参数进行预测
+        df_seir, pred = SEIR_Multi(pos, pred_steps, df_seir, od_flows)
         preds.extend(pred)
         opt_betas.append(pos)
     preds = np.array(preds)
     opt_betas = np.array(opt_betas)
-    # 保存训练结果
-    df_seir.to_csv(BASE_SAVE + '/{}_lastseir_{}steps.csv'.format(NAME, T_INTERVAL), index=True, header=True)
-    np.savetxt(BASE_SAVE + '/{}_betas_{}steps.csv'.format(NAME, T_INTERVAL), opt_betas, delimiter=',', fmt='%.8f')
+    # 保存训练参数结果
+    df_seir.to_csv(BASE_SAVE + '/{}_lastseir_train_{}steps.csv'.format(NAME, T_INTERVAL), index=True, header=True)
+    np.savetxt(BASE_SAVE + '/{}_betas_train_{}steps.csv'.format(NAME, T_INTERVAL), opt_betas, delimiter=',', fmt='%.8f')
     # 训练集所有的预测结果
     np.savetxt(BASE_SAVE + '/{}_infect_train_{}steps.csv'.format(NAME, T_INTERVAL), preds, delimiter=',', fmt='%d')
     print('final predictions...', preds.shape)
@@ -207,25 +211,50 @@ def metric(pred, truth):
 
 # 预测疫情感染人数序列
 def predict(od_flows, infects, method):
+    assert len(od_flows) == len(infects), 'len of od_flows and infects should be equal'
+    T_out = len(od_flows)
+    pred_steps_all = np.arange(T_out)
+    pred_steps_list = []
+    steps_num = math.ceil(T_out / T_INTERVAL)
+    for i in range(steps_num-1):
+        pred_steps_list.append(pred_steps_all[i*T_INTERVAL:(i+1)*T_INTERVAL])
+    pred_steps_list.append(pred_steps_all[(steps_num-1)*T_INTERVAL:])
     # beta参数数据准备
-    betas = np.loadtxt(BASE_SAVE + '/{}_betas_{}steps.csv'.format(NAME, T_INTERVAL), delimiter=',')
-    # 最优的一组beta
+    betas = np.loadtxt(BASE_SAVE + '/{}_betas_train_{}steps.csv'.format(NAME, T_INTERVAL), delimiter=',')
+    # 最近的一组beta
     beta = betas[-1, :]
     # 训练集最后，测试集开始的seir矩阵
-    df_seir = pd.read_csv(BASE_SAVE + '/{}_lastseir_{}steps.csv'.format(NAME, T_INTERVAL), index_col=0)
-    # 进行多步SEIR预测
-    _, pred = SEIR_Multi(beta, np.arange(len(od_flows)), df_seir, od_flows)
+    df_seir = pd.read_csv(BASE_SAVE + '/{}_lastseir_train_{}steps.csv'.format(NAME, T_INTERVAL), index_col=0)
+    # 存储结果的数组
+    preds = []
+    opt_betas = []
+    for pred_steps in pred_steps_list:
+        if args.test_opt:
+            # 进行PSO参数优化
+            cost, pos = run_interval_PSO(pred_steps, df_seir, od_flows, infects)
+            if args.show_train:
+                print(pred_steps, cost, pos, time.ctime())
+            beta = pos
+        # 进行多步SEIR预测
+        df_seir, pred = SEIR_Multi(beta, pred_steps, df_seir, od_flows)
+        preds.extend(pred)
+        opt_betas.append(beta)
+    preds = np.array(preds)
+    opt_betas = np.array(opt_betas)
     # 保存结果
+    # 保存参数结果
+    df_seir.to_csv(BASE_SAVE + '/{}_lastseir_test_{}steps.csv'.format(NAME, T_INTERVAL), index=True, header=True)
+    np.savetxt(BASE_SAVE + '/{}_betas_test_{}steps.csv'.format(NAME, T_INTERVAL), opt_betas, delimiter=',', fmt='%.8f')
     # 测试集所有的预测结果
-    np.savetxt(BASE_SAVE + '/{}_infect_{}_test.csv'.format(NAME, method), pred, delimiter=',', fmt='%d')
-    print('OD flows, GT infections, predicted infections: ', od_flows.shape, infects.shape, pred.shape)
+    np.savetxt(BASE_SAVE + '/{}_infect_{}_{}steps.csv'.format(NAME, method, T_INTERVAL), preds, delimiter=',', fmt='%d')
+    print('OD flows, GT infections, predicted infections: ', od_flows.shape, infects.shape, preds.shape)
     # 输出预测误差
-    RMSE, MAE, MAPE, R2 = metric(pred, infects)
+    RMSE, MAE, MAPE, R2 = metric(preds, infects)
     print('RMSE: ', RMSE)
     print('MAE: ', MAE)
     print('MAPE: ', MAPE)
     print('R2: ', R2)
-    return pred
+    return preds
 
 
 def train():
